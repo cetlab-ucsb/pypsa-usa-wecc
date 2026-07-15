@@ -346,34 +346,62 @@ def demand_scaling_data(wildcards):
         return ""
 
 
-rule build_electrical_demand:
-    wildcard_constraints:
-        end_use="power",  # added for consistency in build_demand.py
-    params:
-        demand_params=config["electricity"]["demand"],
-        eia_api=config["api"]["eia"],
-        profile_year=pd.to_datetime(config["snapshots"]["start"]).year,
-        planning_horizons=config["scenario"]["planning_horizons"],
-        snapshots=config["snapshots"],
-        pudl_path=config_provider("pudl_path"),
-    input:
-        network=RESOURCES + "{interconnect}/elec_base_network.nc",
-        demand_files=demand_raw_data,
-        demand_scaling_file=demand_scaling_data,
-    output:
-        elec_demand=RESOURCES + "{interconnect}/demand/{end_use}_electricity.csv",
-    log:
-        LOGS + "{interconnect}/{end_use}_build_demand.log",
-    benchmark:
-        BENCHMARKS + "{interconnect}/{end_use}_build_demand"
-    threads: 2
-    resources:
-        mem_mb=lambda wildcards, input, attempt: (input.size // 100000) * attempt * 2,
-        walltime=config_provider(
-            "walltime", "build_electrical_demand", default="00:50:00"
-        ),
-    script:
-        "../scripts/build_demand.py"
+if config["electricity"]["demand"]["profile"] == "custom":
+
+    # WECC team addition: bypass EFS/EIA demand building and use pre-built
+    # substation-level hourly demand (see scripts/build_custom_demand.py).
+    rule build_electrical_demand:
+        wildcard_constraints:
+            end_use="power",
+        params:
+            planning_horizons=config["scenario"]["planning_horizons"],
+            snapshots=config["snapshots"],
+            custom_demand_dir=config["electricity"]["demand"]["custom_demand_dir"],
+        input:
+            network=RESOURCES + "{interconnect}/elec_base_network.nc",
+        output:
+            elec_demand=RESOURCES + "{interconnect}/demand/{end_use}_electricity.csv",
+        log:
+            LOGS + "{interconnect}/{end_use}_build_demand.log",
+        threads: 2
+        resources:
+            mem_mb=8000,
+            walltime=config_provider(
+                "walltime", "build_electrical_demand", default="00:50:00"
+            ),
+        script:
+            "../scripts/build_custom_demand.py"
+
+else:
+
+    rule build_electrical_demand:
+        wildcard_constraints:
+            end_use="power",  # added for consistency in build_demand.py
+        params:
+            demand_params=config["electricity"]["demand"],
+            eia_api=config["api"]["eia"],
+            profile_year=pd.to_datetime(config["snapshots"]["start"]).year,
+            planning_horizons=config["scenario"]["planning_horizons"],
+            snapshots=config["snapshots"],
+            pudl_path=config_provider("pudl_path"),
+        input:
+            network=RESOURCES + "{interconnect}/elec_base_network.nc",
+            demand_files=demand_raw_data,
+            demand_scaling_file=demand_scaling_data,
+        output:
+            elec_demand=RESOURCES + "{interconnect}/demand/{end_use}_electricity.csv",
+        log:
+            LOGS + "{interconnect}/{end_use}_build_demand.log",
+        benchmark:
+            BENCHMARKS + "{interconnect}/{end_use}_build_demand"
+        threads: 2
+        resources:
+            mem_mb=lambda wildcards, input, attempt: (input.size // 100000) * attempt * 2,
+            walltime=config_provider(
+                "walltime", "build_electrical_demand", default="00:50:00"
+            ),
+        script:
+            "../scripts/build_demand.py"
 
 
 rule build_service_demand:
