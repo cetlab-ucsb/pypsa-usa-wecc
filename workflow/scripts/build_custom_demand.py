@@ -11,6 +11,7 @@ mirroring the convention of WritePopulation in build_demand.py.
 Inputs (via snakemake):
     network: elec_base_network.nc  (for bus <-> sub_id mapping and Pd)
     params.custom_demand_dir: folder containing bus_hourly_{year}.parquet
+        (optional — if unset or missing, falls back to workflow/data/custom_demand)
     params.planning_horizons, params.snapshots
 
 Output:
@@ -27,6 +28,31 @@ import pypsa
 from _helpers import configure_logging, get_multiindex_snapshots
 
 logger = logging.getLogger(__name__)
+
+# fallback location, relative to workflow/ (snakemake's working directory)
+DEFAULT_DEMAND_DIR = Path("data") / "custom_demand"
+
+
+def resolve_demand_dir(configured) -> Path:
+    """Return the folder holding bus_hourly_{year}.parquet.
+
+    Uses the configured path (electricity: demand: custom_demand_dir) when it
+    exists; otherwise falls back to workflow/data/custom_demand. This lets
+    each team member drop the parquets into data/custom_demand without
+    editing machine-specific paths in the config.
+    """
+    candidates = [Path(configured)] if configured else []
+    candidates.append(DEFAULT_DEMAND_DIR)
+    for cand in candidates:
+        if cand.is_dir():
+            logger.info(f"Using custom demand folder: {cand.resolve()}")
+            return cand
+    raise FileNotFoundError(
+        "No custom demand folder found. Looked for: "
+        + ", ".join(str(c.resolve()) for c in candidates)
+        + ". Drop bus_hourly_{year}.parquet into workflow/data/custom_demand "
+        "or set electricity: demand: custom_demand_dir in the config.",
+    )
 
 
 def snapshot_template() -> pd.DatetimeIndex:
@@ -77,7 +103,7 @@ if __name__ == "__main__":
     planning_horizons = snakemake.params.planning_horizons
     sns = get_multiindex_snapshots(snakemake.params.snapshots, planning_horizons)
 
-    demand_dir = Path(snakemake.params.custom_demand_dir)
+    demand_dir = resolve_demand_dir(snakemake.params.custom_demand_dir)
     weights = sub_to_bus_weights(n)
 
     blocks = []
