@@ -356,7 +356,7 @@ if config["electricity"]["demand"]["profile"] == "custom":
         params:
             planning_horizons=config["scenario"]["planning_horizons"],
             snapshots=config["snapshots"],
-            custom_demand_dir=config["electricity"]["demand"]["custom_demand_dir"],
+            custom_demand_dir=config["electricity"]["demand"].get("custom_demand_dir", ""),
         input:
             network=RESOURCES + "{interconnect}/elec_base_network.nc",
         output:
