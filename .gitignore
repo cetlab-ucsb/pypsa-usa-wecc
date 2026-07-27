@@ -269,3 +269,6 @@ connect.sh
 /workflow/config/config.cluster.yaml
 /workflow/repo_data/dag.png
 !.pre-commit-config.yaml
+
+
+pypsa-usa-wecc/workflow/config/config.api.yaml

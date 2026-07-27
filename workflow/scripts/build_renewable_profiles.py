@@ -12,6 +12,7 @@ import atlite
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import xarray as xr
 from _helpers import configure_logging, get_snapshots
 from dask.distributed import Client
@@ -33,14 +34,19 @@ def get_renewable_snapshots(config, year):
         end_day = ren_sns_config.get("end_day", 31)
         end_inclusive = ren_sns_config.get("end_inclusive", False)
 
+        start = pd.Timestamp(year=year, month=start_month, day=start_day)
+        end = pd.Timestamp(year=year, month=end_month, day=end_day)
+        if end_inclusive:
+            end = end + pd.Timedelta(days=1)
+
         snapshots_config = {
-            "start": f"{year}-{start_month:02d}-{start_day:02d}",
-            "end": f"{year}-{end_month:02d}-{end_day:02d}",
-            "inclusive": "both" if end_inclusive else "left",
+            "start": start,
+            "end": end,
+            "inclusive": "left",
         }
         logger.info(
             f"Using renewable snapshots for year {year}: "
-            f"{snapshots_config['start']} to {snapshots_config['end']} "
+            f"{start.date()} to {pd.Timestamp(year=year, month=end_month, day=end_day).date()} "
             f"({'inclusive' if end_inclusive else 'exclusive'} end)",
         )
         return get_snapshots(snapshots_config)
