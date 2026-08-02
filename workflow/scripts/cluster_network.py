@@ -576,7 +576,92 @@ def cluster_regions(busmaps, input=None, output=None):
         regions_c = regions_c.reset_index()
         regions_c.to_file(getattr(output, which))
 
+def merge_zero_impedance_buses(n, impedance_atol=1e-9, xy_atol=1e-9):
+    """Merge colocated buses connected by effectively zero-impedance lines."""
+    zero_r = np.isclose(n.lines.r.astype(float), 0.0, atol=impedance_atol)
+    zero_x = np.isclose(n.lines.x.astype(float), 0.0, atol=impedance_atol)
+    zero_impedance_lines = n.lines.index[zero_r & zero_x]
 
+    if zero_impedance_lines.empty:
+        logger.info("No zero-impedance lines found.")
+        return pd.Series(n.buses.index, index=n.buses.index)
+
+    parent = pd.Series(n.buses.index, index=n.buses.index).to_dict()
+
+    def find(bus):
+        while parent[bus] != bus:
+            parent[bus] = parent[parent[bus]]
+            bus = parent[bus]
+        return bus
+
+    def union(bus0, bus1):
+        root0 = find(bus0)
+        root1 = find(bus1)
+        if root0 != root1:
+            parent[max(root0, root1, key=str)] = min(root0, root1, key=str)
+
+    lines_to_remove = []
+    lines_to_merge = []
+    lines_not_merged = []
+
+    for line_name, line in n.lines.loc[zero_impedance_lines].iterrows():
+        if line.bus0 == line.bus1:
+            lines_to_remove.append(line_name)
+            continue
+
+        bus0 = n.buses.loc[line.bus0]
+        bus1 = n.buses.loc[line.bus1]
+        same_xy = np.isclose(bus0.x, bus1.x, atol=xy_atol) and np.isclose(
+            bus0.y,
+            bus1.y,
+            atol=xy_atol,
+        )
+
+        if same_xy:
+            union(line.bus0, line.bus1)
+            lines_to_merge.append(line_name)
+        else:
+            lines_not_merged.append(line_name)
+            lines_to_remove.append(line_name)
+
+    busmap = pd.Series({bus: find(bus) for bus in n.buses.index})
+    buses_to_remove = busmap.index[busmap.index != busmap]
+
+    if not buses_to_remove.empty:
+        for c in n.one_port_components | n.branch_components:
+            df = n.df(c)
+            for col in df.columns:
+                if col.startswith("bus"):
+                    df[col] = df[col].map(busmap).fillna(df[col])
+
+        n.mremove("Bus", buses_to_remove)
+
+    self_loop_lines = n.lines.index[n.lines.bus0 == n.lines.bus1]
+    lines_to_remove = pd.Index(lines_to_remove).union(self_loop_lines)
+    if not lines_to_remove.empty:
+        n.mremove("Line", lines_to_remove)
+
+    if lines_to_merge:
+        logger.warning(
+            "Merged %s colocated bus pairs connected by zero-impedance lines: %s",
+            len(lines_to_merge),
+            ", ".join(pd.Index(lines_to_merge).astype(str)),
+        )
+    if len(buses_to_remove):
+        logger.warning(
+            "Removed %s duplicate buses after zero-impedance merge: %s",
+            len(buses_to_remove),
+            ", ".join(buses_to_remove.astype(str)),
+        )
+    if lines_not_merged:
+        logger.warning(
+            "Removed %s zero-impedance lines whose endpoints were not colocated: %s",
+            len(lines_not_merged),
+            ", ".join(pd.Index(lines_not_merged).astype(str)),
+        )
+
+    return busmap
+    
 def plot_busmap(n, busmap, fn=None):
     cs = busmap.unique()
     cr = sns.color_palette("hls", len(cs))
@@ -1091,7 +1176,9 @@ if __name__ == "__main__":
             # Use standard transmission cost estimates
             update_transmission_costs(clustering.network, costs)
 
-    if not transport_model:
+    if params.transmission_network == "tamu" and not transport_model:
+        logger.info("Skipping REEDS NARIS transmission capacity calibration for TAMU network.")
+    elif not transport_model:
         # Apply REEDS transmission capacity corrections
         logger.info("Applying REEDS transmission capacity corrections to TAMU network...")
 

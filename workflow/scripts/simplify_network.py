@@ -12,6 +12,11 @@ import pypsa
 from _helpers import configure_logging, update_p_nom_max
 from cluster_network import cluster_regions, clustering_for_n_clusters
 from pypsa.clustering.spatial import get_clustering_from_busmap
+from cluster_network import (
+    cluster_regions,
+    clustering_for_n_clusters,
+    merge_zero_impedance_buses,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +266,9 @@ if __name__ == "__main__":
 
     if topological_boundaries in ["reeds_zone", "state"] and "county" in n.buses.columns:
         n.buses = n.buses.drop(columns=["county"])
-
+        logger.info("Removing duplicate zero-impedance buses before simplification.")
+        merge_zero_impedance_buses(n)
+    
     if snakemake.wildcards.simpl:
         n.set_investment_periods(periods=snakemake.params.planning_horizons)
 
