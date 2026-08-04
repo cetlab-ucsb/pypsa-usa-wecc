@@ -99,7 +99,18 @@ def aggregate_to_substations(
 ):
     logger.info("Aggregating buses to substation level...")
 
-    generator_strategies = aggregation_strategies.get("generators", dict())
+    generator_strategies = aggregation_strategies.get("generators", dict()).copy()
+    one_port_strategies = aggregation_strategies.get("one_ports", dict()).copy()
+    # Preserve reported vintages when substation aggregation combines assets.
+    if "original_build_year" in network.generators:
+        generator_strategies.setdefault("original_build_year", "capacity_weighted_average")
+    if "original_build_year" in network.storage_units:
+        storage_strategies = one_port_strategies.get("StorageUnit", {}).copy()
+        storage_strategies.setdefault(
+            "original_build_year",
+            "capacity_weighted_average",
+        )
+        one_port_strategies["StorageUnit"] = storage_strategies
 
     clustering = get_clustering_from_busmap(
         network,
@@ -112,6 +123,7 @@ def aggregate_to_substations(
             "Pd": "sum",
         },
         generator_strategies=generator_strategies,
+        one_port_strategies=one_port_strategies,
     )
 
     substations = network.buses[

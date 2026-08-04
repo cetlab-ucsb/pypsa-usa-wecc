@@ -1510,14 +1510,15 @@ if __name__ == "__main__":
     if any("PHS" in s for s in elec_config["extendable_carriers"]["StorageUnit"]):
         attach_phs_storageunits(n, elec_config, costs_dict[n.investment_periods[0]])
 
-    if snakemake.params.retirement == "economic":
-        economic_retirement_gens = set(elec_config.get("conventional_carriers", None))
-        split_retirement_gens(
-            n,
-            costs_dict[n.investment_periods[0]],
-            economic_retirement_gens,
-            economic=True,
-        )
+    # Existing capacity must be separated from the expansion option for every
+    # retirement strategy. Only economic retirement makes the existing tranche
+    # extendable; technical strategies keep it fixed until its modeled endpoint.
+    split_retirement_gens(
+        n,
+        costs_dict[n.investment_periods[0]],
+        set(elec_config.get("conventional_carriers", [])),
+        economic=snakemake.params.retirement == "economic",
+    )
     # Split renewable generators from the first investement period to support lifetime retirement
     split_retirement_gens(
         n,

@@ -224,7 +224,9 @@ def get_capacity_brownfield(
             return (c.df.p_nom_opt).groupby(by=[c.df.bus, c.df.carrier]).sum()
 
     totals = []
-    if retirement_method == "technical":
+    # Both technical modes use lifetime-based assets after the EIA variant has
+    # filtered which plants are active in the first modeled period.
+    if retirement_method in {"technical", "technical_eia"}:
         for c in n.iterate_components(n.one_port_components | n.branch_components):
             if c.name in ("Generator", "StorageUnit", "Link"):
                 totals.append(_technical_retirement(c))
@@ -236,7 +238,8 @@ def get_capacity_brownfield(
         return pd.concat(totals)
     else:
         logger.error(
-            f"Retirement method must be one of 'technical' or 'economic'. Recieved {retirement_method}.",
+            "Retirement method must be one of 'technical', 'technical_eia', "
+            f"or 'economic'. Recieved {retirement_method}.",
         )
         raise NotImplementedError
 

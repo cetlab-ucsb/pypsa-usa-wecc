@@ -345,8 +345,18 @@ def clustering_for_n_clusters(
         busmap = custom_busmap
 
     line_strategies = aggregation_strategies.get("lines", dict())
-    generator_strategies = aggregation_strategies.get("generators", dict())
-    one_port_strategies = aggregation_strategies.get("one_ports", dict())
+    generator_strategies = aggregation_strategies.get("generators", dict()).copy()
+    one_port_strategies = aggregation_strategies.get("one_ports", dict()).copy()
+    # Preserve reported vintages when spatial clustering combines assets.
+    if "original_build_year" in n.generators:
+        generator_strategies.setdefault("original_build_year", "capacity_weighted_average")
+    if "original_build_year" in n.storage_units:
+        storage_strategies = one_port_strategies.get("StorageUnit", {}).copy()
+        storage_strategies.setdefault(
+            "original_build_year",
+            "capacity_weighted_average",
+        )
+        one_port_strategies["StorageUnit"] = storage_strategies
     bus_strategies = {"Pd": "sum"}
     clustering = get_clustering_from_busmap(
         n,
