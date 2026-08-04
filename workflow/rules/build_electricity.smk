@@ -653,6 +653,9 @@ rule add_electricity:
         extendable_carriers=config["electricity"]["extendable_carriers"],
         conventional_carriers=config["electricity"]["conventional_carriers"],
         conventional=config["conventional"],
+        # Forward the strategy so initial-fleet filtering can use either the
+        # generic retirement data or EIA-reported planned dates.
+        retirement=config["electricity"].get("retirement", "technical"),
         costs=config["costs"],
         planning_horizons=config["scenario"]["planning_horizons"],
         eia_api=config["api"]["eia"],

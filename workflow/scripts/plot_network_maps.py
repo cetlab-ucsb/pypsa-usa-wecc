@@ -243,10 +243,11 @@ def plot_capacity_map(
 
     line_width = line_values / line_scale
     link_width = link_values / line_scale
+    bus_sizes = 0 if getattr(bus_values, "empty", False) else bus_values / bus_scale
 
     with plt.rc_context({"patch.linewidth": 0.1}):
         n.plot(
-            bus_sizes=bus_values / bus_scale,
+            bus_sizes=bus_sizes,
             bus_colors=bus_colors,
             bus_alpha=0.7,
             line_widths=line_width,
@@ -478,7 +479,13 @@ def plot_new_capacity_map(
 
     bus_values = bus_pnom_opt - bus_pnom
     bus_values = bus_values[(bus_values > 0) & (bus_values.index.get_level_values(1).isin(carriers))]
-    bus_values = remove_sector_buses(bus_values).reset_index().groupby(by=["bus", "carrier"]).sum().squeeze()
+    bus_values = (
+        remove_sector_buses(bus_values)
+        .reset_index()
+        .groupby(by=["bus", "carrier"])
+        .sum()
+        .squeeze("columns")
+    )
 
     line_snom = n.lines.s_nom
     line_snom_opt = n.lines.s_nom_opt
@@ -490,6 +497,39 @@ def plot_new_capacity_map(
 
     # plot data
     title = create_title("New Network Capacities", **wildcards)
+
+    has_bus_additions = not bus_values.empty
+    has_line_additions = line_values.fillna(0).gt(0).any()
+    has_link_additions = link_values.fillna(0).gt(0).any()
+    if not any((has_bus_additions, has_line_additions, has_link_additions)):
+        logger.warning("No new capacity additions found; writing an empty capacity map.")
+        fig, ax = plt.subplots(
+            figsize=(10, 10),
+            subplot_kw={"projection": ccrs.EqualEarth(n.buses.x.mean())},
+        )
+        regions.plot(
+            ax=ax,
+            facecolor="whitesmoke",
+            edgecolor="white",
+            aspect="equal",
+            transform=ccrs.PlateCarree(),
+            linewidth=1.2,
+        )
+        ax.set_extent(regions.total_bounds[[0, 2, 1, 3]])
+        ax.text(
+            0.5,
+            0.5,
+            "No new capacity additions",
+            horizontalalignment="center",
+            verticalalignment="center",
+            transform=ax.transAxes,
+        )
+        ax.set_title(title, fontsize=TITLE_SIZE, pad=20)
+        fig.tight_layout()
+        fig.savefig(save)
+        plt.close()
+        return
+
     interconnect = wildcards.get("interconnect", None)
     bus_scale = get_bus_scale(interconnect) if interconnect else 1
     line_scale = get_line_scale(interconnect) if interconnect else 1

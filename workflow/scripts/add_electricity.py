@@ -28,6 +28,24 @@ idx = pd.IndexSlice
 
 logger = logging.getLogger(__name__)
 
+RETIREMENT_METHODS = {"economic", "technical", "technical_eia"}
+
+
+def ensure_active_in_first_period(
+    build_year: pd.Series,
+    lifetime: pd.Series | float,
+    first_period: int,
+) -> pd.Series:
+    """Shift only expired build years enough to keep assets active initially."""
+    # PyPSA considers an asset inactive once build_year + lifetime <= period.
+    # The +1 moves only already-expired assets across that strict boundary.
+    minimum_build_year = np.floor(first_period - np.asarray(lifetime, dtype=float)) + 1
+    effective_build_year = np.maximum(
+        pd.to_numeric(build_year).to_numpy(dtype=float),
+        minimum_build_year,
+    )
+    return pd.Series(effective_build_year, index=build_year.index)
+
 
 def sanitize_carriers(n, config):
     """
@@ -210,7 +228,13 @@ def load_powerplants(
     plants_fn,
     investment_periods: list[int],
     interconnect: str | None = None,
+    retirement_method: str = "technical",
 ) -> pd.DataFrame:
+    if retirement_method not in RETIREMENT_METHODS:
+        raise ValueError(
+            f"Unknown retirement method '{retirement_method}'. Expected one of {sorted(RETIREMENT_METHODS)}.",
+        )
+
     plants = pd.read_csv(
         plants_fn,
     )
@@ -221,26 +245,48 @@ def load_powerplants(
         plants["current_planned_generator_operating_date"],
     )
 
-    plants["generator_retirement_date"] = pd.to_datetime(
-        plants["generator_retirement_date"],
-    )
-
     # if operational_status is proposed replace build_year with year of current_planned_generator_operating_date
     plants.loc[plants.operational_status == "proposed", "build_year"] = plants.loc[
         plants.operational_status == "proposed",
         "current_planned_generator_operating_date",
     ].dt.year
 
-    # If operational_status is existing or proposed, replace generator_retirement_date with 1/1/2100
-    retirement_date = pd.to_datetime("2100-01-01")
-    plants.loc[plants.operational_status.isin(["existing", "proposed"]), "generator_retirement_date"] = retirement_date
+    if retirement_method == "technical_eia":
+        # Use the reported planned date to select the initial fleet. A missing
+        # date keeps the asset eligible beyond the modeled horizon.
+        plants["planned_generator_retirement_date"] = pd.to_datetime(
+            plants["planned_generator_retirement_date"],
+            errors="coerce",
+        )
+        plants["generator_retirement_date"] = plants["planned_generator_retirement_date"].fillna(
+            pd.Timestamp("2100-01-01"),
+        )
+        plants = plants.dropna(subset=["build_year"])
+    else:
+        plants["generator_retirement_date"] = pd.to_datetime(
+            plants["generator_retirement_date"],
+        )
 
-    # Handle NaT values
-    plants.loc[plants.generator_retirement_date.isna(), "generator_retirement_date"] = pd.to_datetime("1900-01-01")
+        # If operational_status is existing or proposed, replace generator_retirement_date with 1/1/2100
+        retirement_date = pd.to_datetime("2100-01-01")
+        plants.loc[
+            plants.operational_status.isin(["existing", "proposed"]),
+            "generator_retirement_date",
+        ] = retirement_date
+
+        # Handle NaT values
+        plants.loc[plants.generator_retirement_date.isna(), "generator_retirement_date"] = pd.to_datetime(
+            "1900-01-01",
+        )
 
     # Filter out plants that are not built by first investment period and retired before the first investment period.
     plants = plants[plants.build_year <= investment_periods[0]]
     plants = plants[plants.generator_retirement_date.dt.year > investment_periods[0]]
+
+    if retirement_method == "technical_eia":
+        # Preserve the reported vintage before deriving an effective build year
+        # that keeps an EIA-listed asset active in the first modeled period.
+        plants["original_build_year"] = plants.build_year
 
     # Filter out non-conus plants
     plants = plants[plants.nerc_region != "non-conus"]
@@ -372,7 +418,10 @@ def filter_plants_by_region(
         plants_must_add.set_index("generator_name", inplace=True)
 
         if not remaining_plants.empty:
-            remaining_clean = remaining_plants.drop(columns=["index_right"], errors="ignore")
+            remaining_clean = remaining_plants.drop(
+                columns=["index_right"],
+                errors="ignore",
+            ).to_crs(epsg=3857)
             plants_nearshore = gpd.sjoin_nearest(
                 remaining_clean,
                 regions_onshore.to_crs(epsg=3857),
@@ -394,6 +443,7 @@ def attach_renewable_capacities_to_atlite(
     n: pypsa.Network,
     plants_df: pd.DataFrame,
     renewable_carriers: list,
+    retirement_method: str = "technical",
 ):
     plants = plants_df.query(
         "bus_assignment in @n.buses.index",
@@ -436,7 +486,17 @@ def attach_renewable_capacities_to_atlite(
         mapped_values = generators_tech.sub_assignment.map(
             build_year_avg.build_year,
         ).dropna()
-        n.generators.loc[mapped_values.index, "build_year"] = mapped_values.astype(int)
+        mapped_values = mapped_values.astype(int)
+        if retirement_method == "technical_eia":
+            # Aggregated renewables retain their capacity-weighted reported
+            # vintage even when their effective PyPSA vintage must be shifted.
+            n.generators.loc[mapped_values.index, "original_build_year"] = mapped_values
+            mapped_values = ensure_active_in_first_period(
+                mapped_values,
+                n.generators.loc[mapped_values.index, "lifetime"],
+                int(n.investment_periods[0]),
+            ).astype(int)
+        n.generators.loc[mapped_values.index, "build_year"] = mapped_values
 
 
 def attach_conventional_generators(
@@ -450,6 +510,7 @@ def attach_conventional_generators(
     conventional_inputs,
     unit_commitment=None,
     fuel_price=None,
+    retirement_method: str = "technical",
 ):
     carriers = [
         carrier
@@ -489,6 +550,17 @@ def attach_conventional_generators(
     # Define generators using modified ppl DataFrame
     caps = plants.groupby("carrier").p_nom.sum().div(1e3).round(2)
     logger.info(f"Adding {len(plants)} generators with capacities [GW] \n{caps}")
+    technology_lifetime = plants.carrier.map(costs.lifetime)
+    build_year = plants.build_year.astype(int)
+    if retirement_method == "technical_eia":
+        # Some units reported online by EIA are older than the generic lifetime.
+        # Shift only the effective vintage so they exist in the first period;
+        # original_build_year remains available for provenance and aggregation.
+        build_year = ensure_active_in_first_period(
+            build_year,
+            technology_lifetime,
+            int(n.investment_periods[0]),
+        ).astype(int)
     n.madd(
         "Generator",
         plants.index,
@@ -505,8 +577,8 @@ def attach_conventional_generators(
         efficiency=plants.efficiency.round(3),
         marginal_cost=plants.marginal_cost,
         capital_cost=plants.annualized_capex_fom,
-        build_year=plants.build_year.astype(int).fillna(0),
-        lifetime=plants.carrier.map(costs.lifetime),
+        build_year=build_year,
+        lifetime=technology_lifetime,
         committable=unit_commitment,
         **committable_attrs,
     )
@@ -517,7 +589,9 @@ def attach_conventional_generators(
     )
     n.generators.loc[plants.index, "fuel_cost"] = plants.fuel_cost
     n.generators.loc[plants.index, "heat_rate"] = plants.heat_rate_mmbtu_per_mwh
-    n.generators.loc[plants.index, "ba_eia"] = plants.balancing_authority_code
+    n.generators.loc[plants.index, "ba_eia"] = plants.balancing_authority_code_eia
+    if retirement_method == "technical_eia":
+        n.generators.loc[plants.index, "original_build_year"] = plants.original_build_year
 
 
 def normed(s):
@@ -789,6 +863,7 @@ def attach_battery_storage(
     n: pypsa.Network,
     costs: pd.DataFrame,
     plants: pd.DataFrame,
+    retirement_method: str = "technical",
 ):
     """Attaches Existing Battery Energy Storage Systems To the Network."""
     plants_filt = plants.query("carrier == 'battery' ")
@@ -801,6 +876,16 @@ def attach_battery_storage(
     )
 
     plants_filt = plants_filt.dropna(subset=["energy_storage_capacity_mwh"])
+    technology_lifetime = costs.at["4hr_battery_storage", "lifetime"]
+    build_year = plants_filt.build_year
+    if retirement_method == "technical_eia":
+        # Keep an EIA-listed battery active initially even if its reported
+        # vintage exceeds the generic four-hour battery lifetime.
+        build_year = ensure_active_in_first_period(
+            build_year,
+            technology_lifetime,
+            int(n.investment_periods[0]),
+        ).astype(int)
     n.madd(  # Adds storage units which can retire economically or at their lifetime
         "StorageUnit",
         plants_filt.index,
@@ -812,12 +897,14 @@ def attach_battery_storage(
         p_nom_extendable=False,  # Only Allow lifetime retirments for existing BESS
         capital_cost=costs.at["4hr_battery_storage", "opex_fixed_per_kw"] * 1e3,
         max_hours=plants_filt.energy_storage_capacity_mwh / plants_filt.p_nom,
-        build_year=plants_filt.build_year,
-        lifetime=costs.at["4hr_battery_storage", "lifetime"],
+        build_year=build_year,
+        lifetime=technology_lifetime,
         efficiency_store=0.85**0.5,
         efficiency_dispatch=0.85**0.5,
         cyclic_state_of_charge=True,
     )
+    if retirement_method == "technical_eia":
+        n.storage_units.loc[plants_filt.index, "original_build_year"] = plants_filt.original_build_year
 
 
 def broadcast_investment_horizons_index(n: pypsa.Network, df: pd.DataFrame):
@@ -1024,6 +1111,7 @@ def apply_pudl_fuel_costs(
 
 def main(snakemake):
     params = snakemake.params
+    retirement_method = getattr(params, "retirement", "technical")
     interconnection = snakemake.wildcards["interconnect"]
 
     n = pypsa.Network(snakemake.input.base_network)
@@ -1047,6 +1135,7 @@ def main(snakemake):
         snakemake.input["powerplants"],
         n.investment_periods,
         interconnect=interconnection,
+        retirement_method=retirement_method,
     )
     plants = filter_plants_by_region(
         plants,
@@ -1078,6 +1167,7 @@ def main(snakemake):
         conventional_inputs,
         unit_commitment=params.conventional["unit_commitment"],
         fuel_price=None,  # update fuel prices later
+        retirement_method=retirement_method,
     )
     apply_seasonal_capacity_derates(
         n,
@@ -1100,6 +1190,7 @@ def main(snakemake):
         n,
         costs,
         plants,
+        retirement_method=retirement_method,
     )
 
     attach_wind_and_solar(
@@ -1119,6 +1210,7 @@ def main(snakemake):
         n,
         plants,
         renewable_carriers,
+        retirement_method=retirement_method,
     )
 
     # temporarily adding hydro with breakthrough only data until I can correctly import hydro_data
