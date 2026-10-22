@@ -272,7 +272,8 @@ connect.sh
 !.pre-commit-config.yaml
 
 
-pypsa-usa-wecc/workflow/config/config.api.yaml
-pypsa-usa-wecc/workflow/data
-pypsa-usa-wecc/workflow/repo_data
+workflow/config/config.api.yaml
+workflow/data
+workflow/repo_data
+sync_hpc.sh
 
