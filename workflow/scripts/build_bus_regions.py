@@ -193,6 +193,12 @@ def main(snakemake):
 
         logger.info(f"Added {len(empty_counties)} empty counties assigned to nearest buses.")
 
+    onshore_regions_concat = onshore_regions_concat.dissolve(
+        by="name",
+        as_index=False,
+        aggfunc={"x": "first", "y": "first", "country": "first"},
+        )
+    
     onshore_regions_concat.to_file(snakemake.output.regions_onshore)
     combined_onshore = onshore_regions_concat.geometry.union_all()
 

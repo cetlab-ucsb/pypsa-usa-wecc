@@ -45,6 +45,11 @@ def sector_input_files(wildcards):
             }
         )
 
+    if config["electricity"]["demand"].get("data_centers", {}).get("enable", False):
+        input_files["data_center_demand"] = (
+            DATA + "custom_demand/reeds_zone_data_center_year_scenario_hourly_mwh.csv"
+        )
+
     return input_files
 
 

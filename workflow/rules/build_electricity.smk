@@ -356,7 +356,7 @@ if config["electricity"]["demand"]["profile"] == "custom":
         params:
             planning_horizons=config["scenario"]["planning_horizons"],
             snapshots=config["snapshots"],
-            custom_demand_dir=config["electricity"]["demand"].get("custom_demand_dir", ""),
+            custom_demand_scenario=config["electricity"]["demand"].get("custom_demand_scenario", "baseline"),
         input:
             network=RESOURCES + "{interconnect}/elec_base_network.nc",
         output:
@@ -612,7 +612,12 @@ rule build_fuel_prices:
 
 
 def dynamic_fuel_price_files(wildcards):
-    if config["conventional"]["dynamic_fuel_price"]["wholesale"]:
+    dynamic_fuel_price = config["conventional"]["dynamic_fuel_price"]
+    # Mirror the enable gate in add_electricity.py so Snakemake does not build
+    # unused wholesale fuel-price files when dynamic pricing is disabled.
+    if dynamic_fuel_price.get("enable", False) and dynamic_fuel_price.get(
+        "wholesale", False
+    ):
         return {
             "state_ng_fuel_prices": RESOURCES
             + "{interconnect}/state_ng_power_prices.csv",
@@ -645,6 +650,36 @@ rule build_powerplants:
         "../scripts/build_powerplants.py"
 
 
+rule build_rooftop_solar:
+    input:
+        powerplants=rules.build_powerplants.output.powerplants,
+        lbnl=DATA
+        + "rooftop_solar/Tracking the Sun 2024 Data File/"
+        + "TTS_LBNL_public_file_21-Aug-2024_all.csv",
+        zip_tract=DATA + "rooftop_solar/ZIP-TRACT_032026.xlsx",
+        tract_coordinates=DATA
+        + "rooftop_solar/2025_Gaz_tracts_national.txt",
+        tract_population=DATA + "rooftop_solar/tract-agegroup-2020.xlsx",
+        counties=DATA + "counties/cb_2020_us_county_500k.shp",
+        state_capacity=DATA + "rooftop_solar/net_metering_2024.xlsx",
+        nerc_regions="repo_data/geospatial/NERC_Regions/"
+        + "NERC_Regions_Subregions.shp",
+    output:
+        powerplants="resources/powerplants_w_btm.csv",
+    resources:
+        mem_mb=30000,
+        walltime=config_provider(
+            "walltime",
+            "build_rooftop_solar",
+            default="01:00:00",
+        ),
+    shell:
+        "cd scripts && python build_rooptop_solar.py"
+
+
+BTM_ENABLED = config["electricity"].get("enable_btm", False)
+
+
 rule add_electricity:
     params:
         length_factor=config["lines"]["length_factor"],
@@ -656,6 +691,11 @@ rule add_electricity:
         # Forward the strategy so initial-fleet filtering can use either the
         # generic retirement data or EIA-reported planned dates.
         retirement=config["electricity"].get("retirement", "technical"),
+        proposed_plant_scenario=config_provider(
+            "electricity",
+            "proposed_plant_scenario",
+            default="reference",
+        ),
         costs=config["costs"],
         planning_horizons=config["scenario"]["planning_horizons"],
         eia_api=config["api"]["eia"],
@@ -699,11 +739,29 @@ rule add_electricity:
         regions_offshore=RESOURCES
         + "{interconnect}/Geospatial/regions_offshore.geojson",
         reeds_shapes=RESOURCES + "{interconnect}/Geospatial/reeds_shapes.geojson",
-        powerplants="resources/powerplants.csv",
+        powerplants=(
+            rules.build_rooftop_solar.output.powerplants
+            if BTM_ENABLED
+            else rules.build_powerplants.output.powerplants
+        ),
+        btm_solar_profile=(
+            DATA
+            + "capacity_factors_for_distributed_pv_2024/"
+            + "distributed_pv_capacity_factors_2024.nc"
+            if BTM_ENABLED
+            else []
+        ),
         plants_breakthrough=DATA + "breakthrough_network/base_grid/plant.csv",
         hydro_breakthrough=DATA + "breakthrough_network/base_grid/hydro.csv",
         bus2sub=RESOURCES + "{interconnect}/bus2sub.csv",
-        pudl_fuel_costs=RESOURCES + "{interconnect}/pudl_fuel_costs.csv",
+        # Only require plant-level PUDL prices when they will be applied; an
+        # unconditional input would pull build_fuel_prices into every DAG.
+        pudl_fuel_costs=(
+            RESOURCES + "{interconnect}/pudl_fuel_costs.csv"
+            if config["conventional"]["dynamic_fuel_price"].get("enable", False)
+            and config["conventional"]["dynamic_fuel_price"].get("pudl", False)
+            else []
+        ),
         specs_egs=(
             DATA + "EGS/{interconnect}/specs_EGS.nc"
             if "EGS" in config["electricity"]["extendable_carriers"]["Generator"]
@@ -794,7 +852,7 @@ rule cluster_network:
         itl_reeds_zone="repo_data/ReEDS_Constraints/transmission/transmission_capacity_init_AC_ba_NARIS2024.csv",
         itl_county="repo_data/ReEDS_Constraints/transmission/transmission_capacity_init_AC_county_NARIS2024.csv",
         itl_trans_grp="repo_data/ReEDS_Constraints/transmission/transmission_capacity_init_AC_transgrp_NARIS2024.csv",
-        itl_costs_reeds_zone="repo_data/ReEDS_Constraints/transmission/transmission_distance_cost_500kVdc_ba.csv",
+        itl_costs_reeds_zone="repo_data/ReEDS_Constraints/transmission/transmission_distance_cost_500kVac_ba.csv",
         itl_costs_county="repo_data/ReEDS_Constraints/transmission/transmission_distance_cost_500kVac_county.csv",
         itl_state="repo_data/ReEDS_Constraints/transmission/transmission_capacity_init_AC_state_NARIS2024.csv",
         itl_costs_state="repo_data/ReEDS_Constraints/transmission/transmission_distance_cost_500kVdc_state.csv",

@@ -235,7 +235,7 @@ def build_existing_and_proposed_generators(
         & (~yearly_generators_raw["operational_status_code"].isin(EXCLUDED_PROPOSED_OPERATIONAL_STATUS_CODES))
         & (yearly_generators_raw["report_date"] >= report_start)
         & state_filter
-        & (yearly_generators_raw["data_maturity"] == 'final')
+        # & (yearly_generators_raw["data_maturity"] == 'final')
     ].copy().sort_values("report_date", ascending=False, kind="mergesort")
 
     yearly_generators_proposed = yearly_generators_proposed.drop_duplicates(

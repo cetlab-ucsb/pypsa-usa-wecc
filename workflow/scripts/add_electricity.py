@@ -29,6 +29,13 @@ idx = pd.IndexSlice
 logger = logging.getLogger(__name__)
 
 RETIREMENT_METHODS = {"economic", "technical", "technical_eia"}
+PROPOSED_PLANT_SCENARIOS = {
+    "reference": {"L": 2035, "P": 2040},
+    "optimistic": {"P": 2035},
+    "pessimistic": {"T": 2035, "L": 2040, "P": 2040},
+}
+BTM_SOLAR_CARRIER = "solar-rooftop"
+BTM_BATTERY_CARRIER = "battery-btm"
 
 
 def ensure_active_in_first_period(
@@ -229,10 +236,16 @@ def load_powerplants(
     investment_periods: list[int],
     interconnect: str | None = None,
     retirement_method: str = "technical",
+    proposed_plant_scenario: str = "reference",
 ) -> pd.DataFrame:
     if retirement_method not in RETIREMENT_METHODS:
         raise ValueError(
             f"Unknown retirement method '{retirement_method}'. Expected one of {sorted(RETIREMENT_METHODS)}.",
+        )
+    if proposed_plant_scenario not in PROPOSED_PLANT_SCENARIOS:
+        raise ValueError(
+            f"Unknown proposed plant scenario '{proposed_plant_scenario}'. "
+            f"Expected one of {sorted(PROPOSED_PLANT_SCENARIOS)}.",
         )
 
     plants = pd.read_csv(
@@ -250,6 +263,15 @@ def load_powerplants(
         plants.operational_status == "proposed",
         "current_planned_generator_operating_date",
     ].dt.year
+
+    proposed_build_year = plants["operational_status_code"].map(
+        PROPOSED_PLANT_SCENARIOS[proposed_plant_scenario],
+    )
+    proposed_mask = (plants.operational_status == "proposed") & proposed_build_year.notna()
+    plants.loc[proposed_mask, "build_year"] = np.maximum(
+        plants.loc[proposed_mask, "build_year"],
+        proposed_build_year.loc[proposed_mask],
+    )
 
     if retirement_method == "technical_eia":
         # Use the reported planned date to select the initial fleet. A missing
@@ -859,6 +881,233 @@ def attach_egs(
             )
 
 
+def aggregate_btm_plants_by_substation(
+    n: pypsa.Network,
+    plants: pd.DataFrame,
+    carrier: str,
+    include_energy: bool = False,
+) -> pd.DataFrame:
+    """Aggregate tract-level BTM records at their modeled substations."""
+    plants_filt = plants.loc[plants.carrier.eq(carrier)].copy()
+    if plants_filt.empty:
+        return pd.DataFrame()
+
+    plants_filt["sub_id"] = plants_filt["bus_assignment"].map(
+        n.buses["sub_id"]
+    )
+    if plants_filt["sub_id"].isna().any():
+        raise ValueError(
+            f"Every {carrier} record must map to a modeled substation"
+        )
+    if not pd.api.types.is_integer_dtype(plants_filt["sub_id"]):
+        raise TypeError("sub_id must contain integers such as 35000")
+    if plants_filt["p_nom"].isna().any() or plants_filt["p_nom"].le(0).any():
+        raise ValueError(f"Every {carrier} record must have positive p_nom")
+    if not plants_filt["build_year"].eq(2024).all():
+        raise ValueError(f"Every {carrier} record must have build_year 2024")
+
+    aggregated = plants_filt.groupby("sub_id").agg(
+        p_nom=("p_nom", "sum"),
+        bus=("bus_assignment", "first"),
+    )
+    aggregated["build_year"] = 2024
+    if include_energy:
+        energy = plants_filt["energy_storage_capacity_mwh"]
+        if energy.isna().any() or energy.le(0).any():
+            raise ValueError(
+                f"Every {carrier} record must have positive battery energy"
+            )
+        aggregated["energy_storage_capacity_mwh"] = (
+            plants_filt.groupby("sub_id")["energy_storage_capacity_mwh"].sum()
+        )
+
+    return aggregated
+
+
+def load_btm_solar_profile(
+    profile_path: str,
+    required_substations: pd.Index,
+) -> pd.DataFrame:
+    """Load and validate a substation-by-time rooftop-solar NetCDF profile."""
+    if not profile_path:
+        raise ValueError(
+            "solar-rooftop capacity is present, but the add_electricity rule "
+            "does not provide a btm_solar_profile NetCDF input"
+        )
+
+    with xr.open_dataset(profile_path) as ds:
+        if set(ds.data_vars) != {"ac_power_kw"}:
+            raise ValueError(
+                "BTM solar NetCDF must contain only the ac_power_kw variable"
+            )
+        profile_array = ds["ac_power_kw"]
+        if profile_array.dims != ("time", "sub_id"):
+            raise ValueError(
+                "ac_power_kw dimensions must be exactly (time, sub_id)"
+            )
+        if profile_array.sizes["time"] != 8760:
+            raise ValueError("ac_power_kw must contain exactly 8760 timestamps")
+        if not np.issubdtype(profile_array["time"].dtype, np.datetime64):
+            raise TypeError("time must be a datetime coordinate")
+        if not np.issubdtype(profile_array["sub_id"].dtype, np.integer):
+            raise TypeError("sub_id must contain integers such as 35000")
+        if profile_array["time"].to_index().duplicated().any():
+            raise ValueError("time contains duplicate timestamps")
+        if profile_array["sub_id"].to_index().duplicated().any():
+            raise ValueError("sub_id contains duplicate values")
+
+        missing_substations = required_substations.difference(
+            profile_array["sub_id"].to_index()
+        )
+        if not missing_substations.empty:
+            raise ValueError(
+                f"ac_power_kw is missing {len(missing_substations)} required "
+                "substations"
+            )
+
+        profile = (
+            profile_array.sel(sub_id=required_substations.to_list())
+            .to_pandas()
+            .astype("float32")
+        )
+
+    profile_values = profile.to_numpy(copy=False)
+    if not np.isfinite(profile_values).all():
+        raise ValueError("ac_power_kw contains missing or infinite values")
+    if profile_values.min() < 0 or profile_values.max() > 1:
+        raise ValueError("ac_power_kw values must be between zero and one")
+
+    return profile
+
+
+def attach_rooftop_solar(
+    n: pypsa.Network,
+    costs: pd.DataFrame,
+    plants: pd.DataFrame,
+    profile_path: str | None,
+    retirement_method: str = "technical",
+):
+    """Attach fixed BTM solar capacity and its substation-level profile."""
+    aggregated = aggregate_btm_plants_by_substation(
+        n,
+        plants,
+        BTM_SOLAR_CARRIER,
+    )
+    if aggregated.empty:
+        return
+
+    profiles = load_btm_solar_profile(profile_path, aggregated.index)
+    profiles = broadcast_investment_horizons_index(n, profiles)
+
+    generator_names = pd.Index(
+        "BTM solar substation " + aggregated.index.astype(str),
+    )
+    aggregated.index = generator_names
+    profiles.columns = generator_names
+
+    technology_lifetime = costs.at["solar", "lifetime"]
+    build_year = aggregated["build_year"]
+    if retirement_method == "technical_eia":
+        build_year = ensure_active_in_first_period(
+            build_year,
+            technology_lifetime,
+            int(n.investment_periods[0]),
+        ).astype(int)
+
+    add_missing_carriers(n, [BTM_SOLAR_CARRIER])
+    n.madd(
+        "Generator",
+        aggregated.index,
+        carrier=BTM_SOLAR_CARRIER,
+        bus=aggregated["bus"],
+        p_nom=aggregated["p_nom"],
+        p_nom_min=aggregated["p_nom"],
+        p_nom_max=aggregated["p_nom"],
+        p_nom_extendable=False,
+        marginal_cost=0.0,
+        capital_cost=0.0,
+        efficiency=1.0,
+        build_year=build_year,
+        lifetime=technology_lifetime,
+        p_max_pu=profiles,
+    )
+    if retirement_method == "technical_eia":
+        n.generators.loc[aggregated.index, "original_build_year"] = 2024
+
+    logger.info(
+        "Added %.3f GW of %s capacity at %s substations.",
+        aggregated["p_nom"].sum() / 1_000,
+        BTM_SOLAR_CARRIER,
+        len(aggregated),
+    )
+
+
+def attach_btm_battery_storage(
+    n: pypsa.Network,
+    costs: pd.DataFrame,
+    plants: pd.DataFrame,
+    retirement_method: str = "technical",
+):
+    """Attach tract-level BTM batteries aggregated by substation."""
+    aggregated = aggregate_btm_plants_by_substation(
+        n,
+        plants,
+        BTM_BATTERY_CARRIER,
+        include_energy=True,
+    )
+    if aggregated.empty:
+        return
+
+    storage_names = pd.Index(
+        "BTM battery substation " + aggregated.index.astype(str),
+    )
+    aggregated.index = storage_names
+
+    technology_lifetime = costs.at["4hr_battery_storage", "lifetime"]
+    build_year = aggregated["build_year"]
+    if retirement_method == "technical_eia":
+        build_year = ensure_active_in_first_period(
+            build_year,
+            technology_lifetime,
+            int(n.investment_periods[0]),
+        ).astype(int)
+
+    add_missing_carriers(n, [BTM_BATTERY_CARRIER])
+    n.madd(
+        "StorageUnit",
+        aggregated.index,
+        carrier=BTM_BATTERY_CARRIER,
+        bus=aggregated["bus"],
+        p_nom=aggregated["p_nom"],
+        p_nom_max=aggregated["p_nom"],
+        p_nom_min=0,
+        p_nom_extendable=False,
+        capital_cost=(
+            costs.at["4hr_battery_storage", "opex_fixed_per_kw"] * 1e3
+        ),
+        marginal_cost=0.0,
+        max_hours=(
+            aggregated["energy_storage_capacity_mwh"]
+            / aggregated["p_nom"]
+        ),
+        build_year=build_year,
+        lifetime=technology_lifetime,
+        efficiency_store=0.85**0.5,
+        efficiency_dispatch=0.85**0.5,
+        cyclic_state_of_charge=True,
+    )
+    if retirement_method == "technical_eia":
+        n.storage_units.loc[aggregated.index, "original_build_year"] = 2024
+
+    logger.info(
+        "Added %.3f GW / %.3f GWh of %s at %s substations.",
+        aggregated["p_nom"].sum() / 1_000,
+        aggregated["energy_storage_capacity_mwh"].sum() / 1_000,
+        BTM_BATTERY_CARRIER,
+        len(aggregated),
+    )
+
+
 def attach_battery_storage(
     n: pypsa.Network,
     costs: pd.DataFrame,
@@ -1112,6 +1361,7 @@ def apply_pudl_fuel_costs(
 def main(snakemake):
     params = snakemake.params
     retirement_method = getattr(params, "retirement", "technical")
+    proposed_plant_scenario = getattr(params, "proposed_plant_scenario", "reference")
     interconnection = snakemake.wildcards["interconnect"]
 
     n = pypsa.Network(snakemake.input.base_network)
@@ -1136,6 +1386,7 @@ def main(snakemake):
         n.investment_periods,
         interconnect=interconnection,
         retirement_method=retirement_method,
+        proposed_plant_scenario=proposed_plant_scenario,
     )
     plants = filter_plants_by_region(
         plants,
@@ -1190,6 +1441,23 @@ def main(snakemake):
         n,
         costs,
         plants,
+        retirement_method=retirement_method,
+    )
+    attach_btm_battery_storage(
+        n,
+        costs,
+        plants,
+        retirement_method=retirement_method,
+    )
+    attach_rooftop_solar(
+        n,
+        costs,
+        plants,
+        profile_path=getattr(
+            snakemake.input,
+            "btm_solar_profile",
+            None,
+        ),
         retirement_method=retirement_method,
     )
 

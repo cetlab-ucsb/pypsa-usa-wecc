@@ -10,7 +10,7 @@ mirroring the convention of WritePopulation in build_demand.py.
 
 Inputs (via snakemake):
     network: elec_base_network.nc  (for bus <-> sub_id mapping and Pd)
-    params.custom_demand_dir: folder containing bus_hourly_{year}.parquet
+    params.custom_demand_scenario: scenario folder under data/custom_demand/
         (optional — if unset or missing, falls back to workflow/data/custom_demand)
     params.planning_horizons, params.snapshots
 
@@ -29,30 +29,19 @@ from _helpers import configure_logging, get_multiindex_snapshots
 
 logger = logging.getLogger(__name__)
 
-# fallback location, relative to workflow/ (snakemake's working directory)
+# Data location relative to workflow/ (Snakemake's working directory)
 DEFAULT_DEMAND_DIR = Path("data") / "custom_demand"
 
 
-def resolve_demand_dir(configured) -> Path:
-    """Return the folder holding bus_hourly_{year}.parquet.
-
-    Uses the configured path (electricity: demand: custom_demand_dir) when it
-    exists; otherwise falls back to workflow/data/custom_demand. This lets
-    each team member drop the parquets into data/custom_demand without
-    editing machine-specific paths in the config.
-    """
-    candidates = [Path(configured)] if configured else []
-    candidates.append(DEFAULT_DEMAND_DIR)
-    for cand in candidates:
-        if cand.is_dir():
-            logger.info(f"Using custom demand folder: {cand.resolve()}")
-            return cand
-    raise FileNotFoundError(
-        "No custom demand folder found. Looked for: "
-        + ", ".join(str(c.resolve()) for c in candidates)
-        + ". Drop bus_hourly_{year}.parquet into workflow/data/custom_demand "
-        "or set electricity: demand: custom_demand_dir in the config.",
-    )
+def resolve_demand_dir(scenario) -> Path:
+    """Find the selected scenario under data/custom_demand, without fallback."""
+    if not isinstance(scenario, str) or not scenario or scenario in (".", "..") or "/" in scenario or "\\" in scenario:
+        raise ValueError("custom_demand_scenario must be a scenario name, not a path")
+    demand_dir = DEFAULT_DEMAND_DIR / scenario
+    if not demand_dir.is_dir():
+        raise FileNotFoundError(f"Custom demand scenario folder not found: {demand_dir}")
+    logger.info("Using custom demand folder: %s", demand_dir.resolve())
+    return demand_dir
 
 
 def snapshot_template() -> pd.DatetimeIndex:
@@ -103,12 +92,17 @@ if __name__ == "__main__":
     planning_horizons = snakemake.params.planning_horizons
     sns = get_multiindex_snapshots(snakemake.params.snapshots, planning_horizons)
 
-    demand_dir = resolve_demand_dir(snakemake.params.custom_demand_dir)
+    demand_dir = resolve_demand_dir(snakemake.params.custom_demand_scenario)
     weights = sub_to_bus_weights(n)
 
     blocks = []
     for year in planning_horizons:
-        f = demand_dir / f"bus_hourly_{year}.parquet"
+        filename = (
+            "bus_hourly_2024.parquet"
+            if year == 2024
+            else f"bus_hourly_no_data_center_{year}.parquet"
+        )
+        f = demand_dir / filename
         df = pd.read_parquet(f)
         df = df.set_index("hour_utc").sort_index()
         assert len(df) == 8760, f"{f}: expected 8760 rows, got {len(df)}"

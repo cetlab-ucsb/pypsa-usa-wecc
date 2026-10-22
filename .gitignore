@@ -13,6 +13,7 @@ dconf
 
 # configuration files
 config/
+.cdsapirc
 
 # generated files
 results/
@@ -272,3 +273,6 @@ connect.sh
 
 
 pypsa-usa-wecc/workflow/config/config.api.yaml
+pypsa-usa-wecc/workflow/data
+pypsa-usa-wecc/workflow/repo_data
+

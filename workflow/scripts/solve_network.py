@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import pypsa
 import yaml
+from add_data_center_w_demand_flexibility import add_data_center_constraints, daily_snapshot_groups
 from _helpers import (
     configure_logging,
     update_config_from_wildcards,
@@ -68,6 +69,36 @@ pypsa.pf.logger.setLevel(logging.WARNING)
 
 
 def prepare_network(n, solve_opts=None):
+    solve_opts = solve_opts or {}
+    if solve_opts.get("rolling_horizon", False):
+        # Use explicit initial energy (default zero) for the first window;
+        # PyPSA carries solved energy forward for subsequent windows.
+        # Disable both cyclic flags so investment-period settings cannot
+        # override the rolling window's initial condition.
+        n.storage_units.loc[:, "cyclic_state_of_charge"] = False
+        n.storage_units.loc[:, "cyclic_state_of_charge_per_period"] = False
+        n.stores.loc[:, "e_cyclic"] = False
+        n.stores.loc[:, "e_cyclic_per_period"] = False
+        if n.meta.get("data_center_btm_battery"):
+            n.meta["data_center_btm_battery"]["boundary"] = (
+                "non-cyclic state of charge carried between rolling windows"
+            )
+    if n.meta.get("data_center_flexibility", {}).get("add_dr", False):
+        settings = n.meta["data_center_flexibility"]
+        if any(solve_opts.get(key) for key in ("nhours", "snapshot_portion")):
+            raise ValueError("Data center flexibility does not support nhours or snapshot_portion")
+        if not np.allclose(n.snapshot_weightings.stores, 1):
+            raise ValueError("Data center flexibility requires one-hour Store weights")
+        shift_buses = settings["shift_buses"]
+        if solve_opts.get("rolling_horizon", False):
+            if solve_opts.get("horizon", 365) != 24 or solve_opts.get("overlap", 0) != 0:
+                raise ValueError("Daily data center flexibility requires horizon=24 and overlap=0")
+            groups = daily_snapshot_groups(n.snapshots)
+            endings = n.snapshots[[positions[-1] for positions in groups]]
+            for attr in ("e_min_pu", "e_max_pu"):
+                getattr(n.stores_t, attr).loc[endings, shift_buses] = 0
+            n.stores.loc[shift_buses, "e_initial"] = 0
+            settings["boundary"] = "zero initial/final; truncated windows per calendar day"
     if "clip_p_max_pu" in solve_opts:
         df = n.generators_t.p_max_pu
         n.generators_t.p_max_pu = df.where(df > solve_opts["clip_p_max_pu"], other=0.0)
@@ -76,22 +107,34 @@ def prepare_network(n, solve_opts=None):
 
         df = n.links_t.p_max_pu
         n.links_t.p_max_pu = df.where(df > solve_opts["clip_p_max_pu"], other=0.0)
+        # Preserve exact year-specific data center capacity and shifting bounds.
+        dc_links = df.columns.intersection(n.links.index[n.links.carrier == "dc-elec"])
+        n.links_t.p_max_pu.loc[:, dc_links] = df.loc[:, dc_links]
         df = n.links_t.p_min_pu
         n.links_t.p_min_pu = df.where(df > solve_opts["clip_p_max_pu"], other=0.0)
 
         df = n.storage_units_t.inflow
         n.storage_units_t.inflow = df.where(df > solve_opts["clip_p_max_pu"], other=0.0)
-    load_shedding = solve_opts.get("load_shedding")
+
+    load_shedding = solve_opts.get("load_shedding", False)
+
     if load_shedding:
-        # intersect between macroeconomic and surveybased willingness to pay
-        # http://journal.frontiersin.org/article/10.3389/fenrg.2015.00055/full
-        # TODO: retrieve color and nice name from config
         logger.warning("Adding load shedding generators.")
-        n.add("Carrier", "load", color="#dd2e23", nice_name="Load shedding")
+
+        n.add(
+            "Carrier",
+            "load",
+            color="#dd2e23",
+            nice_name="Load shedding",
+        )
+
         buses_i = n.buses.query("carrier == 'AC'").index
-        if not np.isscalar(load_shedding):
-            # TODO: do not scale via sign attribute (use Eur/MWh instead of Eur/kWh)
-            load_shedding = 1e2  # Eur/kWh
+
+        # Default penalty: 2000 USD/MWh
+        if isinstance(load_shedding, (bool, np.bool_)):
+            load_shedding = 2000.0
+        else:
+            load_shedding = float(load_shedding)
 
         n.madd(
             "Generator",
@@ -99,9 +142,9 @@ def prepare_network(n, solve_opts=None):
             " load",
             bus=buses_i,
             carrier="load",
-            sign=1e-3,  # Adjust sign to measure p and p_nom in kW instead of MW
-            marginal_cost=load_shedding,  # Eur/kWh
-            p_nom=1e9,  # kW
+            sign=1.0,                   # MW
+            marginal_cost=load_shedding, # USD/MWh
+            p_nom=1e6,                  # MW
         )
 
     if solve_opts.get("noisy_costs"):  ##random noise to costs of generators
@@ -141,6 +184,9 @@ def extra_functionality(n, snapshots):
     opts = n.opts
     config = n.config
     sector_enabled = "sector" in opts
+
+    # NetCDF stores components but not Senga's rolling temporal constraints.
+    add_data_center_constraints(n, snapshots)
 
     # Make snakemake available in function scope if it exists in global scope
     global_snakemake = globals().get("snakemake")
@@ -428,7 +474,13 @@ if __name__ == "__main__":
     if "ERM" in opts:
         store_ERM_duals(n)
 
+    dc_metadata = {
+        key: n.meta[key]
+        for key in ("data_center_flexibility", "data_center_btm_battery")
+        if key in n.meta
+    }
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
+    n.meta.update(dc_metadata)
     n.export_to_netcdf(snakemake.output[0])
     with open(snakemake.output.config, "w") as file:
         yaml.dump(

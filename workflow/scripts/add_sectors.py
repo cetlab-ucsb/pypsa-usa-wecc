@@ -521,6 +521,24 @@ def add_elec_import_emission(n: pypsa.Network):
         n.links.loc[import_links_by_node.index, "bus2"] = state + " pwr-co2"
 
 
+def add_configured_data_centers(n, snakemake):
+    """Apply optional data-center additions before the existing network save."""
+    demand_config = snakemake.params.electricity["demand"]
+    cfg = demand_config.get("data_centers", {})
+    if cfg.get("add_btm_battery", False) and not cfg.get("enable", False):
+        raise ValueError("add_btm_battery requires data_centers.enable: true")
+    if not cfg.get("enable", False):
+        return
+    from add_data_center_w_demand_flexibility import add_data_center_flexibility
+    from add_data_center_w_btm_battery import add_data_center_batteries
+
+    add_data_center_flexibility(
+        n, cfg, snakemake.input.data_center_demand,
+        demand_config.get("custom_demand_scenario", "baseline"),
+    )
+    add_data_center_batteries(n, cfg)
+
+
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
@@ -544,6 +562,7 @@ if __name__ == "__main__":
 
     # exit if only electricity network
     if all(s == "E" for s in sectors):
+        add_configured_data_centers(n, snakemake)
         n.export_to_netcdf(snakemake.output.network)
         sys.exit()
 
@@ -796,4 +815,5 @@ if __name__ == "__main__":
     # emission tracking for electricity imports
     add_elec_import_emission(n)
 
+    add_configured_data_centers(n, snakemake)
     n.export_to_netcdf(snakemake.output.network)

@@ -102,7 +102,6 @@ DATA = "data/"
 RESOURCES = "resources/" + RDIR if not run.get("shared_resources") else "resources/"
 RESULTS = "results/" + RDIR
 
-
 include: "rules/common.smk"
 include: "rules/retrieve.smk"
 include: "rules/build_electricity.smk"
@@ -231,7 +230,17 @@ def validation_figures(wildcards):
 
 rule all:
     input:
-        #"repo_data/dag.jpg",
+        # Finish after solving; plotting is an optional, separate target.
+        expand(
+            RESULTS
+            + "{interconnect}/networks/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}"
+            + ("_operations.nc" if config["run"]["validation"] else ".nc"),
+            **config["scenario"],
+        ),
+
+
+rule plots:
+    input:
         electricity_figures,
         sector_figures,
         validation_figures,
