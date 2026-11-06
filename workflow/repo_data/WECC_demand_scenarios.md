@@ -89,3 +89,15 @@ PUE with EPRI's fleet PUE; the 2031–32 extrapolation rule.
 Also open: the BTM netting basis — the state-level shares remove ~11% of the
 EPRI Medium increment WECC-wide, versus a 27% capacity-weighted WECC share,
 because the high-share states (UT/WY/NM/MT) carry little EPRI energy.
+
+## ReEDS-zone deliverable (2026-11-06, later)
+
+For zone-level runs the demand is also delivered as ReEDS-zone CSVs
+(`wecc/demand/reeds_zone_profiles/`, README there): per scenario and year,
+`nondc`, `dc_total` and `dc_inference` / `dc_training` / `dc_conventional`,
+8760 × 32 zones (p30 merged into p28), MW, 2024 UTC calendar; plus a BTM
+estimate per zone. Scenario folders follow the colleague's 2032 table:
+`indelec_{low,medium,high}` (EFS Medium + DC Medium, heat adoption varies)
+and `growth_{low,medium,high}` (aligned tiers). The substation-level
+`medium_elec_*` parquets above remain available but are not needed for
+zone-level runs.
