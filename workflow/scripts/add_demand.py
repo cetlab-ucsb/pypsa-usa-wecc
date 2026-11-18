@@ -61,7 +61,9 @@ if __name__ == "__main__":
     if isinstance(demand_files, str):
         demand_files = [demand_files]
 
-    if sectors == "E" or sectors == "":  # electricity only
+    if not demand_files and sectors in ("", "E"):
+        logger.info("Custom demand will be attached to the clustered zone buses")
+    elif sectors == "E" or sectors == "":  # electricity only
         assert len(demand_files) == 1
 
         suffix = ""

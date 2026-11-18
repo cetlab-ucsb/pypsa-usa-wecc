@@ -46,9 +46,11 @@ def sector_input_files(wildcards):
         )
 
     if config["electricity"]["demand"].get("data_centers", {}).get("enable", False):
-        input_files["data_center_demand"] = (
-            DATA + "custom_demand/reeds_zone_data_center_year_scenario_hourly_mwh.csv"
-        )
+        scenario = config["electricity"]["demand"].get("custom_demand_scenario", "baseline")
+        input_files["data_center_demand"] = [
+            DATA + f"custom_demand/reeds_zone_profiles_2026-11-06/{scenario}/dc_total_{year}.csv"
+            for year in config["scenario"]["planning_horizons"]
+        ]
 
     return input_files
 

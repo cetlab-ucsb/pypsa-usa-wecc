@@ -15,9 +15,6 @@ DATA_YEAR = 2024
 START_DATE = f"{DATA_YEAR}-01-01"
 END_DATE = f"{DATA_YEAR}-12-01"
 REPORT_START = pd.Timestamp(f"{DATA_YEAR}-01-01")
-# Set to False to build power-plant data for all states.
-WECC_STATES_ONLY = False
-
 
 def resolve_workflow_dir() -> Path:
     """Resolve the workflow directory in both script and interactive sessions."""
@@ -40,24 +37,8 @@ EPA_CROSSWALK_PATH = REPO_DATA_DIR / "plants" / "epa_eia_crosswalk.csv"
 CEMS_PATH = REPO_DATA_DIR / "plants" / "cems_heat_rates.xlsx"
 
 GROUP_COLS = ["plant_id_eia", "generator_id"]
-WECC_STATES = [
-    "AZ",
-    "CA",
-    "CO",
-    "ID",
-    "MT",
-    "NE",
-    "NV",
-    "NM",
-    "OR",
-    "SD",
-    "TX",
-    "UT",
-    "WA",
-    "WY",
-]
-# Exclude proposed records that EIA no longer treats as active development.
-EXCLUDED_PROPOSED_OPERATIONAL_STATUS_CODES = ["CN", "IP", "OT"]
+
+ADDITIONS_REPORT_START = pd.Timestamp("2026-01-01")
 
 YG_VALUE_COLS = [
     "plant_name_eia",
@@ -210,42 +191,68 @@ def build_existing_and_proposed_generators(
     yearly_generators_raw: pd.DataFrame,
     report_start: pd.Timestamp = REPORT_START,
     states: list[str] | None = None,
-    wecc_states_only: bool = WECC_STATES_ONLY,
 ) -> pd.DataFrame:
-    """Build the combined existing/proposed generator table before enrichment."""
-    if states is None and wecc_states_only:
-        states = WECC_STATES
+    """Combine the baseline census (2024 by default) with 2026 additions.
 
-    state_filter = (
-        yearly_generators_raw["state"].isin(states)
-        if states is not None
-        else pd.Series(True, index=yearly_generators_raw.index)
-    )
+    Retain existing 2025/2026 builds and all proposed plants from the 2026
+    snapshot. Supply scenarios are applied when adding plants to the network.
+    Baseline records take precedence for duplicate generator IDs.
+    """
+
     # Existing units use the requested census snapshot.
-    yearly_generators_existing = yearly_generators_raw.loc[
+    yearly_generators_2024 = yearly_generators_raw.loc[
         (yearly_generators_raw["operational_status"] == "existing")
         & (yearly_generators_raw["report_date"] == report_start)
-        & state_filter
     ].copy()
 
-    # Proposed units may be revised after the census date, so retain the latest
-    # final record for each plant/generator pair.
+    additions_snapshot = yearly_generators_raw["report_date"].eq(ADDITIONS_REPORT_START)
+
+    build_year = pd.to_datetime(
+        yearly_generators_raw["generator_operating_date"], errors="coerce",
+    ).dt.year
+
+    yearly_generators_2026 = yearly_generators_raw.loc[additions_snapshot].copy()
+
+    # Use 2026 dates (including blanks); keep 2024 dates only for absent generators.
+    retirement_col = "planned_generator_retirement_date"
+    latest_2026 = yearly_generators_2026.drop_duplicates(
+        GROUP_COLS, keep="last",
+    ).set_index(GROUP_COLS)
+    yearly_generators_2024 = yearly_generators_2024.set_index(GROUP_COLS)
+    matched = yearly_generators_2024.index.intersection(latest_2026.index)
+    yearly_generators_2024.loc[matched, retirement_col] = latest_2026.loc[
+        matched, retirement_col
+    ]
+
+    # Keep retired units in the historical census, but use observed 2025/2026
+    # retirements to override the planned dates after updating from 2026.
+    actual_retirement = pd.to_datetime(
+        latest_2026["generator_retirement_date"], errors="coerce",
+    )
+    recently_retired = (
+        latest_2026["operational_status"].eq("retired")
+        & actual_retirement.dt.year.isin([2025, 2026])
+    )
+    retired_matched = matched.intersection(latest_2026.index[recently_retired])
+    yearly_generators_2024.loc[retired_matched, retirement_col] = actual_retirement.loc[
+        retired_matched
+    ]
+    yearly_generators_2024 = yearly_generators_2024.reset_index()
+
+    yearly_generators_additions_2025_2026 = yearly_generators_raw.loc[
+        yearly_generators_raw["operational_status"].eq("existing")
+        & additions_snapshot
+        & build_year.isin([2025, 2026])
+    ].copy()
+
     yearly_generators_proposed = yearly_generators_raw.loc[
         (yearly_generators_raw["operational_status"] == "proposed")
-        & (~yearly_generators_raw["operational_status_code"].isin(EXCLUDED_PROPOSED_OPERATIONAL_STATUS_CODES))
-        & (yearly_generators_raw["report_date"] >= report_start)
-        & state_filter
-        # & (yearly_generators_raw["data_maturity"] == 'final')
-    ].copy().sort_values("report_date", ascending=False, kind="mergesort")
-
-    yearly_generators_proposed = yearly_generators_proposed.drop_duplicates(
-        subset=GROUP_COLS,
-        keep="first",
-    )
+        & additions_snapshot
+    ].copy()
 
     return (
         pd.concat(
-            [yearly_generators_existing, yearly_generators_proposed],
+            [yearly_generators_2024, yearly_generators_additions_2025_2026, yearly_generators_proposed],
             ignore_index=True,
         )
         .drop_duplicates(subset=GROUP_COLS, keep="first")
@@ -281,15 +288,12 @@ def load_eia_operable_data(
     parquet_path: str,
     report_start: pd.Timestamp = REPORT_START,
     states: list[str] | None = None,
-    wecc_states_only: bool = WECC_STATES_ONLY,
 ) -> pd.DataFrame:
     """Load operable/proposed generator data from PUDL parquet files."""
     raw = read_pudl_inputs(parquet_path, include_monthly=False)
     yearly_generators_existing_and_proposed = build_existing_and_proposed_generators(
         raw["yearly_generators_raw"],
         report_start,
-        states,
-        wecc_states_only,
     )
     storage = build_storage(raw["storage_raw"])
     pudl_plants = build_pudl_plants(raw["pudl_plants_raw"])
@@ -307,11 +311,8 @@ def build_heat_rates_from_raw(
     start_date: str = START_DATE,
     end_date: str = END_DATE,
     states: list[str] | None = None,
-    wecc_states_only: bool = WECC_STATES_ONLY,
 ) -> pd.DataFrame:
     """Build monthly heat-rate and fuel-cost records for temporal averaging."""
-    if states is None and wecc_states_only:
-        states = WECC_STATES
 
     monthly_state_filter = (
         monthly_generators_raw["state"].isin(states)
@@ -364,7 +365,6 @@ def load_heat_rates_data(
     start_date: str,
     end_date: str,
     states: list[str] | None = None,
-    wecc_states_only: bool = WECC_STATES_ONLY,
 ) -> pd.DataFrame:
     """Load heat-rate and fuel-cost data from PUDL parquet files."""
     raw = read_pudl_inputs(parquet_path, include_storage=False)
@@ -376,7 +376,6 @@ def load_heat_rates_data(
         start_date,
         end_date,
         states,
-        wecc_states_only,
     )
 
 
@@ -853,7 +852,6 @@ def build_powerplants(
     epa_crosswalk_path: str | Path,
     cems_path: str | Path,
     data_year: int = DATA_YEAR,
-    wecc_states_only: bool = WECC_STATES_ONLY,
 ) -> pd.DataFrame:
     """Run the existing-and-proposed power-plant build."""
     report_start = pd.Timestamp(f"{data_year}-01-01")
@@ -863,13 +861,11 @@ def build_powerplants(
     eia_data_operable = load_eia_operable_data(
         pudl_path,
         report_start,
-        wecc_states_only=wecc_states_only,
     )
     heat_rates = load_heat_rates_data(
         pudl_path,
         start_date,
         end_date,
-        wecc_states_only=wecc_states_only,
     )
     eia_data_operable = merge_heat_rate_and_fuel_costs(eia_data_operable, heat_rates)
     eia_data_operable = apply_cems_heat_rates(
@@ -904,6 +900,5 @@ if __name__ == "__main__":
         epa_crosswalk_path=snakemake.input.epa_crosswalk,
         cems_path=snakemake.input.cems,
         data_year=data_year,
-        wecc_states_only=WECC_STATES_ONLY,
     )
     plants.to_csv(snakemake.output.powerplants, index=False)

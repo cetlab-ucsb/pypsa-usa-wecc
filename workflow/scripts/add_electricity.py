@@ -29,11 +29,6 @@ idx = pd.IndexSlice
 logger = logging.getLogger(__name__)
 
 RETIREMENT_METHODS = {"economic", "technical", "technical_eia"}
-PROPOSED_PLANT_SCENARIOS = {
-    "reference": {"L": 2035, "P": 2040},
-    "optimistic": {"P": 2035},
-    "pessimistic": {"T": 2035, "L": 2040, "P": 2040},
-}
 BTM_SOLAR_CARRIER = "solar-rooftop"
 BTM_BATTERY_CARRIER = "battery-btm"
 
@@ -231,6 +226,28 @@ def update_transmission_costs(n, costs, length_factor=1.0):
     n.links.loc[dc_b, "capital_cost"] = costs
 
 
+SUPPLY_SCENARIOS = {
+    "pessimistic": ["TS", "U", "V", "T"],
+    "reference": ["TS", "U", "V", "T", "L"],
+    "optimistic": ["TS", "U", "V", "T", "L", "P"],
+}
+
+
+def filter_proposed_plants(plants: pd.DataFrame, scenario: str) -> pd.DataFrame:
+    """Select proposed status codes while preserving all non-proposed plants."""
+    if scenario not in SUPPLY_SCENARIOS:
+        raise ValueError(
+            f"Unknown proposed_plant_scenario {scenario!r}; "
+            f"expected one of {sorted(SUPPLY_SCENARIOS)}."
+        )
+    keep = (
+        ~plants["operational_status"].eq("proposed")
+        | plants["operational_status_code"].isin(SUPPLY_SCENARIOS[scenario])
+    )
+    logger.info("Supply scenario %s excludes %s proposed plants.", scenario, (~keep).sum())
+    return plants.loc[keep].copy()
+
+
 def load_powerplants(
     plants_fn,
     investment_periods: list[int],
@@ -242,16 +259,12 @@ def load_powerplants(
         raise ValueError(
             f"Unknown retirement method '{retirement_method}'. Expected one of {sorted(RETIREMENT_METHODS)}.",
         )
-    if proposed_plant_scenario not in PROPOSED_PLANT_SCENARIOS:
-        raise ValueError(
-            f"Unknown proposed plant scenario '{proposed_plant_scenario}'. "
-            f"Expected one of {sorted(PROPOSED_PLANT_SCENARIOS)}.",
-        )
 
     plants = pd.read_csv(
         plants_fn,
     )
     plants = plants.set_index("generator_name")
+    plants = filter_proposed_plants(plants, proposed_plant_scenario)
 
     # Convert date columns to datetime
     plants["current_planned_generator_operating_date"] = pd.to_datetime(
@@ -263,15 +276,6 @@ def load_powerplants(
         plants.operational_status == "proposed",
         "current_planned_generator_operating_date",
     ].dt.year
-
-    proposed_build_year = plants["operational_status_code"].map(
-        PROPOSED_PLANT_SCENARIOS[proposed_plant_scenario],
-    )
-    proposed_mask = (plants.operational_status == "proposed") & proposed_build_year.notna()
-    plants.loc[proposed_mask, "build_year"] = np.maximum(
-        plants.loc[proposed_mask, "build_year"],
-        proposed_build_year.loc[proposed_mask],
-    )
 
     if retirement_method == "technical_eia":
         # Use the reported planned date to select the initial fleet. A missing
@@ -289,10 +293,11 @@ def load_powerplants(
             plants["generator_retirement_date"],
         )
 
-        # If operational_status is existing or proposed, replace generator_retirement_date with 1/1/2100
+        # Preserve an observed retirement for a generator built and retired in the census year.
         retirement_date = pd.to_datetime("2100-01-01")
         plants.loc[
-            plants.operational_status.isin(["existing", "proposed"]),
+            plants.operational_status.eq("existing")
+            | (plants.operational_status.eq("proposed") & plants.generator_retirement_date.isna()),
             "generator_retirement_date",
         ] = retirement_date
 
@@ -1361,7 +1366,6 @@ def apply_pudl_fuel_costs(
 def main(snakemake):
     params = snakemake.params
     retirement_method = getattr(params, "retirement", "technical")
-    proposed_plant_scenario = getattr(params, "proposed_plant_scenario", "reference")
     interconnection = snakemake.wildcards["interconnect"]
 
     n = pypsa.Network(snakemake.input.base_network)
@@ -1386,7 +1390,7 @@ def main(snakemake):
         n.investment_periods,
         interconnect=interconnection,
         retirement_method=retirement_method,
-        proposed_plant_scenario=proposed_plant_scenario,
+        proposed_plant_scenario=getattr(params, "proposed_plant_scenario", "reference"),
     )
     plants = filter_plants_by_region(
         plants,

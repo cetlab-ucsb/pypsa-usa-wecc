@@ -527,6 +527,8 @@ def add_configured_data_centers(n, snakemake):
     cfg = demand_config.get("data_centers", {})
     if cfg.get("add_btm_battery", False) and not cfg.get("enable", False):
         raise ValueError("add_btm_battery requires data_centers.enable: true")
+    if cfg.get("add_btm_gas_plant", False) and not cfg.get("enable", False):
+        raise ValueError("add_btm_gas_plant requires data_centers.enable: true")
     if not cfg.get("enable", False):
         return
     from add_data_center_w_demand_flexibility import add_data_center_flexibility
@@ -537,6 +539,10 @@ def add_configured_data_centers(n, snakemake):
         demand_config.get("custom_demand_scenario", "baseline"),
     )
     add_data_center_batteries(n, cfg)
+    if cfg.get("add_btm_gas_plant", False):
+        from add_data_center_w_btm_gas_turbine import add_data_center_gas_turbines
+
+        add_data_center_gas_turbines(n, cfg)
 
 
 if __name__ == "__main__":

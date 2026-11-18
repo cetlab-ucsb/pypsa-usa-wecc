@@ -267,13 +267,18 @@ TSWLatexianTemp*
 
 # Exceptions to gitignore
 connect.sh
-/workflow/config/config.cluster.yaml
-/workflow/repo_data/dag.png
+
 !.pre-commit-config.yaml
 
 
-workflow/config/config.api.yaml
-workflow/data
-workflow/repo_data
+/workflow/config/config.api.yaml
+/workflow/config/config.cluster.yaml
+/workflow/data
+/workflow/repo_data
+/workflow/repo_data/
+/process_results/processed_results_raw
+/process_results/plots
+/process_results/other_codes
+/results
 sync_hpc.sh
 

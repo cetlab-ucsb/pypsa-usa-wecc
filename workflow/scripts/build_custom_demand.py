@@ -1,36 +1,15 @@
-"""Build electrical demand from a user-supplied substation-level dataset.
-
-WECC team addition (not upstream PyPSA-USA). Activated when
-`electricity: demand: profile: custom` is set in the config. Instead of
-building demand from EFS/EIA, this reads pre-built substation-level hourly
-demand (one parquet per planning horizon, columns = Breakthrough Energy
-sub_ids, 8760 rows of MW indexed by hour_utc 0-8759) and disaggregates each
-substation's load to that substation's buses in proportion to bus Pd —
-mirroring the convention of WritePopulation in build_demand.py.
-
-Inputs (via snakemake):
-    network: elec_base_network.nc  (for bus <-> sub_id mapping and Pd)
-    params.custom_demand_scenario: scenario folder under data/custom_demand/
-        (optional — if unset or missing, falls back to workflow/data/custom_demand)
-    params.planning_horizons, params.snapshots
-
-Output:
-    power_electricity.csv — index: datetime (8760 h per horizon, no Feb 29),
-    columns: bus names, values: MW. Identical contract to the native
-    build_electrical_demand output consumed by add_demand.py.
-"""
+"""Build zonal demand from precomputed hourly non-data-center ReEDS zone profiles."""
 
 import logging
 from pathlib import Path
 
 import pandas as pd
-import pypsa
 from _helpers import configure_logging, get_multiindex_snapshots
 
 logger = logging.getLogger(__name__)
 
 # Data location relative to workflow/ (Snakemake's working directory)
-DEFAULT_DEMAND_DIR = Path("data") / "custom_demand"
+DEFAULT_DEMAND_DIR = Path("data/custom_demand/reeds_zone_profiles_2026-11-06")
 
 
 def resolve_demand_dir(scenario) -> Path:
@@ -44,39 +23,6 @@ def resolve_demand_dir(scenario) -> Path:
     return demand_dir
 
 
-def snapshot_template() -> pd.DatetimeIndex:
-    """8760 hourly stamps of a non-leap year (matches get_snapshots template)."""
-    return pd.date_range("2019-01-01", "2020-01-01", freq="h", inclusive="left")
-
-
-def sub_to_bus_weights(n: pypsa.Network) -> pd.DataFrame:
-    """Return DataFrame(bus, sub_id, weight): Pd share of each bus within its sub.
-
-    Buses at a sub with zero total Pd share the load equally.
-    """
-    b = n.buses[["sub_id", "Pd"]].copy()
-    b["Pd"] = b.Pd.fillna(0)
-    b["sub_id"] = b.sub_id.astype(int).astype(str)
-    tot = b.groupby("sub_id").Pd.transform("sum")
-    cnt = b.groupby("sub_id").Pd.transform("size")
-    b["weight"] = (b.Pd / tot).where(tot > 0, 1.0 / cnt)
-    return b.reset_index().rename(columns={"Bus": "bus", "index": "bus"})
-
-
-def disaggregate(sub_demand: pd.DataFrame, weights: pd.DataFrame) -> pd.DataFrame:
-    """sub_id-column demand (MW) -> bus-column demand (MW)."""
-    known = weights[weights.sub_id.isin(sub_demand.columns)]
-    missing = sorted(set(sub_demand.columns) - set(weights.sub_id))
-    if missing:
-        lost = sub_demand[missing].sum().sum() / 1e6
-        logger.warning(
-            f"{len(missing)} sub_ids not in network (dropping {lost:.3f} TWh): "
-            f"{missing[:10]}{'...' if len(missing) > 10 else ''}",
-        )
-    bus_demand = sub_demand[known.sub_id].to_numpy() * known.weight.to_numpy()
-    return pd.DataFrame(bus_demand, index=sub_demand.index, columns=known.bus)
-
-
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
@@ -88,27 +34,21 @@ if __name__ == "__main__":
         )
     configure_logging(snakemake)
 
-    n = pypsa.Network(snakemake.input.network)
     planning_horizons = snakemake.params.planning_horizons
     sns = get_multiindex_snapshots(snakemake.params.snapshots, planning_horizons)
 
     demand_dir = resolve_demand_dir(snakemake.params.custom_demand_scenario)
-    weights = sub_to_bus_weights(n)
 
     blocks = []
     for year in planning_horizons:
-        filename = (
-            "bus_hourly_2024.parquet"
-            if year == 2024
-            else f"bus_hourly_no_data_center_{year}.parquet"
-        )
-        f = demand_dir / filename
-        df = pd.read_parquet(f)
-        df = df.set_index("hour_utc").sort_index()
-        assert len(df) == 8760, f"{f}: expected 8760 rows, got {len(df)}"
-        df.index = snapshot_template().map(lambda x: x.replace(year=year))
-        blocks.append(disaggregate(df, weights))
-        logger.info(f"{year}: {blocks[-1].sum().sum() / 1e6:.1f} TWh over {blocks[-1].shape[1]} buses")
+        f = demand_dir / f"nondc_{year}.csv"
+        df = pd.read_csv(f, index_col="hour_utc", parse_dates=["datetime_utc"]).sort_index()
+        if not df.index.equals(pd.RangeIndex(8760)):
+            raise ValueError(f"{f}: expected each hour_utc from 0 to 8759 exactly once")
+        timestamps = pd.DatetimeIndex(df.pop("datetime_utc")).rename(None)
+        df.index = timestamps.map(lambda stamp: stamp.replace(year=year))
+        blocks.append(df)
+        logger.info(f"{year}: {blocks[-1].sum().sum() / 1e6:.1f} TWh over {blocks[-1].shape[1]} zones")
 
     demand = pd.concat(blocks)
     assert len(demand) == len(sns), (
@@ -117,5 +57,5 @@ if __name__ == "__main__":
     )
     assert not demand.isna().any().any()
 
-    demand.round(4).to_csv(snakemake.output.elec_demand, index=True)
+    demand.to_csv(snakemake.output.elec_demand, index=True)
     logger.info(f"Custom demand written to {snakemake.output.elec_demand}")

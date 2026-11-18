@@ -26,10 +26,10 @@ def add_data_center_batteries(n, cfg):
     if not isinstance(n.snapshots, pd.MultiIndex) or n.snapshots.nlevels != 2 or n.snapshots.empty:
         raise ValueError("Data-center batteries require (investment period, timestamp) snapshots")
 
-    factor = float(cfg.get("battery_power_rating_sizing_factor", 0.2))
+    factor = float(cfg.get("battery_power_rating_sizing_factor", 0.1))
     duration = float(cfg.get("battery_ep_ratio", 4.0))
     round_trip_efficiency = float(cfg.get("battery_round_trip_efficiency", 0.85))
-    utilization = float(cfg.get("utilization", 0.9))
+    utilization = float(cfg.get("utilization", 1))
     if not np.isfinite([factor, duration, round_trip_efficiency, utilization]).all():
         raise ValueError("Battery sizing, efficiencies, and utilization must be finite")
     if factor < 0 or duration <= 0:

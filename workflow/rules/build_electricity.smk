@@ -349,7 +349,7 @@ def demand_scaling_data(wildcards):
 if config["electricity"]["demand"]["profile"] == "custom":
 
     # WECC team addition: bypass EFS/EIA demand building and use pre-built
-    # substation-level hourly demand (see scripts/build_custom_demand.py).
+    # ReEDS-zone hourly demand (see scripts/build_custom_demand.py).
     rule build_electrical_demand:
         wildcard_constraints:
             end_use="power",
@@ -358,7 +358,12 @@ if config["electricity"]["demand"]["profile"] == "custom":
             snapshots=config["snapshots"],
             custom_demand_scenario=config["electricity"]["demand"].get("custom_demand_scenario", "baseline"),
         input:
-            network=RESOURCES + "{interconnect}/elec_base_network.nc",
+            profiles=[
+                DATA + "custom_demand/reeds_zone_profiles_2026-11-06/"
+                + config["electricity"]["demand"].get("custom_demand_scenario", "baseline")
+                + f"/nondc_{year}.csv"
+                for year in config["scenario"]["planning_horizons"]
+            ],
         output:
             elec_demand=RESOURCES + "{interconnect}/demand/{end_use}_electricity.csv",
         log:
@@ -519,7 +524,15 @@ rule build_transport_other_demand:
         "../scripts/build_demand.py"
 
 
+custom_zonal_demand = (
+    config["electricity"]["demand"]["profile"] == "custom"
+    and config["scenario"]["sector"] in ("", "E")
+)
+
+
 def demand_to_add(wildcards):
+    if custom_zonal_demand:
+        return []
 
     if config["scenario"]["sector"] == "E":
         return RESOURCES + "{interconnect}/demand/power_electricity.csv"
@@ -640,9 +653,9 @@ rule build_powerplants:
         cems="repo_data/plants/cems_heat_rates.xlsx",
         epa_crosswalk="repo_data/plants/epa_eia_crosswalk.csv",
     output:
-        powerplants="resources/powerplants.csv",
+        powerplants=RESOURCES + "powerplants.csv",
     log:
-        "logs/build_powerplants.log",
+        LOGS + "build_powerplants.log",
     resources:
         mem_mb=30000,
         walltime=config_provider("walltime", "build_powerplants", default="00:30:00"),
@@ -682,6 +695,9 @@ BTM_ENABLED = config["electricity"].get("enable_btm", False)
 
 rule add_electricity:
     params:
+        proposed_plant_scenario=config_provider(
+            "electricity", "proposed_plant_scenario", default="reference"
+        ),
         length_factor=config["lines"]["length_factor"],
         renewable=config["renewable"],
         renewable_carriers=config["electricity"]["renewable_carriers"],
@@ -691,11 +707,6 @@ rule add_electricity:
         # Forward the strategy so initial-fleet filtering can use either the
         # generic retirement data or EIA-reported planned dates.
         retirement=config["electricity"].get("retirement", "technical"),
-        proposed_plant_scenario=config_provider(
-            "electricity",
-            "proposed_plant_scenario",
-            default="reference",
-        ),
         costs=config["costs"],
         planning_horizons=config["scenario"]["planning_horizons"],
         eia_api=config["api"]["eia"],
@@ -838,6 +849,10 @@ rule cluster_network:
         s_max_pu=config_provider("lines", "s_max_pu", default=0.7),
     input:
         network=RESOURCES + "{interconnect}/elec_s{simpl}.nc",
+        zonal_demand=(
+            RESOURCES + "{interconnect}/demand/power_electricity.csv"
+            if custom_zonal_demand else []
+        ),
         regions_onshore=RESOURCES
         + "{interconnect}/Geospatial/regions_onshore_s{simpl}.geojson",
         regions_offshore=RESOURCES

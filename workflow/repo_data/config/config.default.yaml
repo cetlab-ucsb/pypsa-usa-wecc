@@ -59,7 +59,9 @@ renewable_snapshots:
 electricity:
   conventional_carriers: [nuclear, oil, OCGT, CCGT, coal, geothermal, biomass, waste] # Choose the conventional plant types to include in network
   renewable_carriers: [onwind, offwind_floating, solar, hydro] # Choose the renewable plant types to include in network
-  retirement: economic # "economic" or "technical"
+  # economic lets the optimizer retire capacity; technical uses modeled lifetimes;
+  # technical_eia also filters the initial fleet using EIA planned retirements.
+  retirement: economic
   SAFE_reservemargin: 0.14
   regional_Co2_limits: 'config/policy_constraints/regional_Co2_limits.csv'
   technology_capacity_targets: 'config/policy_constraints/technology_capacity_targets.csv'

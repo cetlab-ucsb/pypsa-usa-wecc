@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import pypsa
 import yaml
-from add_data_center_w_demand_flexibility import add_data_center_constraints, daily_snapshot_groups
+from add_data_center_w_demand_flexibility import add_data_center_constraints, validate_hourly_snapshots
 from _helpers import (
     configure_logging,
     update_config_from_wildcards,
@@ -91,14 +91,17 @@ def prepare_network(n, solve_opts=None):
             raise ValueError("Data center flexibility requires one-hour Store weights")
         shift_buses = settings["shift_buses"]
         if solve_opts.get("rolling_horizon", False):
-            if solve_opts.get("horizon", 365) != 24 or solve_opts.get("overlap", 0) != 0:
-                raise ValueError("Daily data center flexibility requires horizon=24 and overlap=0")
-            groups = daily_snapshot_groups(n.snapshots)
-            endings = n.snapshots[[positions[-1] for positions in groups]]
-            for attr in ("e_min_pu", "e_max_pu"):
-                getattr(n.stores_t, attr).loc[endings, shift_buses] = 0
+            horizon = solve_opts.get("horizon", 365)
+            overlap = solve_opts.get("overlap", 0)
+            if not (isinstance(horizon, int) and isinstance(overlap, int)
+                    and 0 <= overlap < horizon
+                    and overlap >= settings["shifting_horizon_hours"]):
+                raise ValueError("Rolling flexibility requires horizon > overlap >= shifting_horizon_hours")
+            validate_hourly_snapshots(n.snapshots)
+            # Keep the original bounds at every hour, including midnight.
+            # PyPSA carries energy from the last committed hour into each window.
             n.stores.loc[shift_buses, "e_initial"] = 0
-            settings["boundary"] = "zero initial/final; truncated windows per calendar day"
+            settings["boundary"] = "rolling energy and deadline carryover; zero at investment-period end"
     if "clip_p_max_pu" in solve_opts:
         df = n.generators_t.p_max_pu
         n.generators_t.p_max_pu = df.where(df > solve_opts["clip_p_max_pu"], other=0.0)

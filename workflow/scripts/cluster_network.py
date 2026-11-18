@@ -1157,6 +1157,19 @@ if __name__ == "__main__":
         periods=snakemake.params.planning_horizons,
     )
 
+    if snakemake.input.zonal_demand:
+        network = clustering.network
+        profiles = pd.read_csv(snakemake.input.zonal_demand, index_col=0, parse_dates=True)
+        if not profiles.index.equals(network.snapshots.get_level_values(-1)):
+            raise ValueError("Custom demand timestamps differ from the network snapshots")
+        profiles.index = network.snapshots
+        for zone, profile in profiles.items():
+            load = f"{zone} AC"
+            bus = zone if zone in network.buses.index else load
+            if bus not in network.buses.index:
+                raise ValueError(f"No matching clustered bus for demand zone {zone}")
+            network.add("Load", load, bus=bus, carrier="AC", p_set=profile)
+
     clustering.network.export_to_netcdf(snakemake.output.network)
 
     for attr in (
